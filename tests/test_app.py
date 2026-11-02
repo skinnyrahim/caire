@@ -8,12 +8,39 @@ TODAY = date(2026, 6, 15)
 
 
 @pytest.fixture
-def client(tmp_path):
+def app(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin-pass-1")
     clock = {"d": TODAY}
-    app = create_app(str(tmp_path / "t.db"), today=lambda: clock["d"])
-    app.config["SIMULATE"] = True
+    a = create_app(str(tmp_path / "t.db"), today=lambda: clock["d"])
+    a.config["SIMULATE"] = True
+    a.clock = clock
+    return a
+
+
+def login(app, username="admin", password="admin-pass-1"):
     c = app.test_client()
-    c.clock = clock
+    r = c.post("/api/login", json={"username": username, "password": password})
+    assert r.status_code == 200, r.json
+    c.clock = app.clock
+    return c
+
+
+def make_staff(admin, username, role, password="temp-pass-1"):
+    r = admin.post("/api/staff", json={"username": username, "name": username.title(), "role": role, "password": password})
+    assert r.status_code == 201, r.json
+
+
+@pytest.fixture
+def client(app):
+    return login(app)
+
+
+@pytest.fixture
+def reviewer(app, client):
+    make_staff(client, "rita", "reviewer")
+    c = login(app, "rita", "temp-pass-1")
+    assert c.post("/api/me/password", json={"current": "temp-pass-1", "new": "rita-pass-22"}).status_code == 200
     return c
 
 
@@ -25,7 +52,7 @@ def enrol(c, name="Ama Mensah", phone="0241112233", **kw):
 
 def pay(c, mid):
     p = c.post("/api/payments", json={"member_id": mid, "network": "MTN MoMo"}).json
-    return c.post(f"/api/payments/{p['id']}/approve").json
+    return c.post(f"/api/payments/{p['id']}/approve", json={}).json
 
 
 def claim(c, mid, **kw):
@@ -58,8 +85,8 @@ def test_premium_starts_and_stacks_cover(client):
 def test_declined_payment_gives_no_cover(client):
     mid = enrol(client)
     p = client.post("/api/payments", json={"member_id": mid, "network": "MTN MoMo"}).json
-    assert client.post(f"/api/payments/{p['id']}/decline").status_code == 200
-    assert client.post(f"/api/payments/{p['id']}/approve").status_code == 409
+    assert client.post(f"/api/payments/{p['id']}/decline", json={}).status_code == 200
+    assert client.post(f"/api/payments/{p['id']}/approve", json={}).status_code == 409
     assert client.get("/api/members").json[0]["covered"] is False
 
 
@@ -99,12 +126,13 @@ def test_flags(client):
     assert cash["payable"] == 8 * CFG["cash_per_day"] and "Long stay (7+ days)" in cash["flags"]
 
 
-def test_rejected_claims_free_the_limit_and_transitions(client):
+def test_rejected_claims_free_the_limit_and_transitions(client, reviewer):
     mid = enrol(client)
     pay(client, mid)
     c = claim(client, mid, type="cash", days=8)
-    assert client.post(f"/api/claims/{c['id']}/status", json={"status": "Paid"}).status_code == 409
-    assert client.post(f"/api/claims/{c['id']}/status", json={"status": "Rejected"}).json["status"] == "Rejected"
+    assert reviewer.post(f"/api/claims/{c['id']}/status", json={"status": "Paid"}).status_code == 409
+    r = reviewer.post(f"/api/claims/{c['id']}/status", json={"status": "Rejected"}).json
+    assert r["status"] == "Rejected" and r["reviewed_by"] == "rita"
     assert client.get(f"/api/eligibility?q={mid}").json["remaining"]["days"] == CFG["cash_max_days"]
 
 
@@ -132,8 +160,76 @@ def test_spot_check_dispute(client):
 
 
 def test_seed_reset_and_export(client):
-    assert len(client.post("/api/demo/seed").json["added"]) == 3
+    assert len(client.post("/api/demo/seed", json={}).json["added"]) == 3
     assert client.get("/api/summary").json["covered"] == 2
     assert client.get("/api/export/claims.csv").data.startswith(b"id,member_id")
-    client.post("/api/demo/reset")
+    client.post("/api/demo/reset", json={})
     assert client.get("/api/members").json == []
+
+
+def test_api_requires_login(app):
+    c = app.test_client()
+    assert c.get("/api/members").status_code == 401
+    assert c.post("/api/members", json={}).status_code == 401
+    assert c.get("/healthz").status_code == 200
+    assert c.post("/api/login", json={"username": "admin", "password": "nope"}).status_code == 401
+
+
+def test_login_lockout(app):
+    c = app.test_client()
+    for _ in range(5):
+        c.post("/api/login", json={"username": "admin", "password": "wrong"})
+    assert c.post("/api/login", json={"username": "admin", "password": "admin-pass-1"}).status_code == 429
+
+
+def test_writes_must_be_json(client):
+    assert client.post("/api/members", data={"name": "x"}).status_code == 415
+
+
+def test_new_staff_must_change_password(app, client):
+    make_staff(client, "dora", "desk")
+    d = login(app, "dora", "temp-pass-1")
+    assert d.get("/api/me").json["must_change"] is True
+    assert d.get("/api/members").status_code == 403
+    assert d.post("/api/me/password", json={"current": "temp-pass-1", "new": "short"}).status_code == 400
+    assert d.post("/api/me/password", json={"current": "temp-pass-1", "new": "dora-pass-22"}).status_code == 200
+    assert d.get("/api/members").status_code == 200
+
+
+def test_roles_and_separation_of_duties(app, client, reviewer):
+    make_staff(client, "dora", "desk", "dora-pass-1")
+    d = login(app, "dora", "dora-pass-1")
+    d.post("/api/me/password", json={"current": "dora-pass-1", "new": "dora-pass-22"})
+    mid = enrol(d)
+    pay(d, mid)
+    c = claim(d, mid, type="cash", days=8)
+    assert c["created_by"] == "dora"
+    assert d.post(f"/api/claims/{c['id']}/status", json={"status": "Approved"}).status_code == 403
+    assert d.get("/api/staff").status_code == 403
+    assert d.post("/api/demo/reset", json={}).status_code == 403
+    assert reviewer.get("/api/staff").status_code == 403
+    assert reviewer.post(f"/api/claims/{c['id']}/status", json={"status": "Approved"}).status_code == 200
+    own = claim(reviewer, mid, type="cash", days=7)
+    r = reviewer.post(f"/api/claims/{own['id']}/status", json={"status": "Approved"})
+    assert r.status_code == 403 and "another reviewer" in r.json["error"]
+    actions = [a["action"] for a in client.get("/api/audit").json]
+    assert "claim_approved" in actions and "member_enrolled" in actions
+
+
+def test_disabling_staff_ends_their_session(app, client):
+    make_staff(client, "dora", "desk", "dora-pass-1")
+    d = login(app, "dora", "dora-pass-1")
+    uid = [u for u in client.get("/api/staff").json if u["username"] == "dora"][0]["id"]
+    client.post(f"/api/staff/{uid}", json={"active": False})
+    assert d.get("/api/me").status_code == 401
+    me = client.get("/api/me").json["id"]
+    assert client.post(f"/api/staff/{me}", json={"active": False}).status_code == 400
+
+
+def test_password_reset_signs_out_old_sessions(app, client):
+    make_staff(client, "dora", "desk", "dora-pass-1")
+    d = login(app, "dora", "dora-pass-1")
+    uid = [u for u in client.get("/api/staff").json if u["username"] == "dora"][0]["id"]
+    client.post(f"/api/staff/{uid}", json={"password": "new-temp-pass"})
+    assert d.get("/api/me").status_code == 401
+    assert login(app, "dora", "new-temp-pass").get("/api/me").json["must_change"] is True

@@ -1,5 +1,7 @@
 // CAIRE Cover clinic desk. Talks to the Flask API in app.py.
-const T = ['Enrol', 'Premium', 'Eligibility', 'Claim', 'Ledger'];
+const T = ['Enrol', 'Premium', 'Eligibility', 'Claim', 'Ledger', 'Staff'];
+const LVL = {desk: 1, reviewer: 2, admin: 3};
+let ME = null, staff = [], auditRows = [];
 let CFG = null, tab = 0, members = [], pays = [], claims = [], sum = {};
 let pend = null;      // pending mobile money prompt
 let pc = null;        // pending claim waiting for the member's code
@@ -25,6 +27,7 @@ async function api(path, body, method) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   let d = null; try { d = await r.json(); } catch (e) {}
+  if (r.status === 401 && path !== 'login' && path !== 'me') { ME = null; showLogin(); }
   if (!r.ok) throw new Error((d && d.error) || 'Something went wrong. Try again.');
   return d;
 }
@@ -36,9 +39,65 @@ async function run(fn, btn) {
   finally { if (btn) btn.disabled = false; }
 }
 
+const can = r => ME && LVL[ME.role] >= LVL[r];
+
 async function load() {
   [members, pays, claims, sum] = await Promise.all([api('members'), api('payments'), api('claims'), api('summary')]);
+  if (can('admin')) [staff, auditRows] = await Promise.all([api('staff'), api('audit')]);
   render();
+}
+
+// ---------- sign in ----------
+function shell(on) {
+  $('#nav').hidden = !on; $('#who').hidden = !on;
+  $('#demo').hidden = !(on && CFG && CFG.simulate && can('admin'));
+}
+function showLogin() {
+  shell(false);
+  $('#m').innerHTML = `<h2>Sign in</h2><p class="mut">Use the staff account given to you by the CAIRE administrator.</p>
+  <form class="card" onsubmit="event.preventDefault();doLogin(this.querySelector('button'))"><div class="g"><label>Username<input id="lu" autocomplete="username" autocapitalize="none"></label>
+  <label>Password<input id="lp" type="password" autocomplete="current-password"></label></div><button class="b">Sign in</button></form>`;
+  $('#lu').focus();
+}
+function showPwChange(forced) {
+  shell(!forced);
+  $('#m').innerHTML = `<h2>${forced ? 'Set your own password' : 'Change password'}</h2><p class="mut">${forced ? 'Your account has a temporary password. Choose a new one to continue.' : ''} Use at least 8 characters.</p>
+  <form class="card" onsubmit="event.preventDefault();doPw(this.querySelector('button.b'))"><div class="g"><label>Current password<input id="pc" type="password" autocomplete="current-password"></label>
+  <label>New password<input id="pn1" type="password" autocomplete="new-password"></label><label>New password again<input id="pn2" type="password" autocomplete="new-password"></label></div>
+  <button class="b">Save password</button> ${forced ? '' : '<button type="button" class="s" onclick="render()">Cancel</button>'}</form>`;
+}
+function doLogin(btn) {
+  run(async () => { ME = await api('login', {username: val('lu'), password: $('#lp').value}); await start(); }, btn);
+}
+function doPw(btn) {
+  run(async () => {
+    if ($('#pn1').value !== $('#pn2').value) throw new Error('The new passwords do not match.');
+    await api('me/password', {current: $('#pc').value, new: $('#pn1').value});
+    toast('Password saved.'); ME.must_change = false; await start();
+  }, btn);
+}
+function logout() { run(async () => { await api('logout', {}); ME = null; pend = pc = elig = null; tab = 0; showLogin(); }); }
+async function start() {
+  if (ME.must_change) return showPwChange(true);
+  CFG = await api('config');
+  $('#sub').textContent = 'Clinic desk, pilot' + (CFG.simulate ? '. Mobile money and SMS are simulated.' : '');
+  $('#foot').textContent = `Benefits per member per year: gap cover up to ${gh(CFG.gap_limit)}, hospital cash ${gh(CFG.cash_per_day)} a day for up to ${CFG.cash_max_days} days.`;
+  $('#who').innerHTML = `${esc(ME.name)} <span class="mut">(${esc(ME.role)})</span> <button class="s" onclick="showPwChange(false)">Password</button><button class="s" onclick="logout()">Sign out</button>`;
+  shell(true);
+  await load();
+}
+
+// ---------- staff (admin) ----------
+function addStaff(btn) {
+  run(async () => {
+    const u = await api('staff', {name: val('sn'), username: val('su'), role: val('sr'), password: $('#sp').value});
+    toast(`${u.name} added. Give them the temporary password; they will set their own when they sign in.`); await load();
+  }, btn);
+}
+function editStaff(id, patch, btn) { run(async () => { await api('staff/' + id, patch); toast('Saved.'); await load(); }, btn); }
+function resetPw(id, name, btn) {
+  const p = prompt(`Temporary password for ${name} (at least 8 characters):`);
+  if (p) editStaff(id, {password: p}, btn);
 }
 
 const go = i => { tab = i; render(); };
@@ -158,33 +217,46 @@ function vClaim() {
 }
 
 function vLedger() {
+  const rv = can('reviewer');
   const rows = claims.map(c => {
-    const a = c.status === 'Needs review' ? `<button class="s" onclick="setSt('${c.id}','Approved',this)">Approve</button><button class="s r" onclick="setSt('${c.id}','Rejected',this)">Reject</button>`
+    const a = !rv ? '' : c.created_by === ME.username && (c.status === 'Needs review' || c.status === 'Approved') ? '<span class="mut">Another reviewer must decide (you submitted it).</span>'
+      : c.status === 'Needs review' ? `<button class="s" onclick="setSt('${c.id}','Approved',this)">Approve</button><button class="s r" onclick="setSt('${c.id}','Rejected',this)">Reject</button>`
       : c.status === 'Approved' ? `<button class="s" onclick="setSt('${c.id}','Paid',this)">Mark paid</button>` : '';
-    const sp = c.spot === 'pending' ? `<br>Call ${esc(c.member_phone)}: did the visit happen?<br><button class="s" onclick="spot('${c.id}','confirmed',this)">Yes</button><button class="s r" onclick="spot('${c.id}','disputed',this)">No</button>`
+    const sp = c.spot === 'pending' && rv ? `<br>Call ${esc(c.member_phone)}: did the visit happen?<br><button class="s" onclick="spot('${c.id}','confirmed',this)">Yes</button><button class="s r" onclick="spot('${c.id}','disputed',this)">No</button>`
       : c.spot ? `<br>${pill('Call: ' + c.spot, c.spot === 'confirmed' ? 'ok' : 'bad')}` : '';
     return `<tr><td>${esc(c.id)}</td><td>${esc(c.member_name)}</td><td>${esc(c.visit_date)}<br><span class="mut">${esc(c.diagnosis)}</span></td><td>${c.type === 'gap' ? 'Gap' + (c.amount_billed !== c.payable ? `<br><span class="mut">billed ${gh(c.amount_billed)}</span>` : '') : 'Cash, ' + c.days + ' d'}</td><td>${gh(c.payable)}</td>
-    <td>${pill(c.status, c.status === 'Needs review' ? 'warn' : c.status === 'Rejected' ? 'bad' : 'ok')}${c.flags.length ? '<br><span class="mut">' + esc(c.flags.join('; ')) + '</span>' : ''}</td><td>${a}${sp}</td></tr>`;
+    <td>${pill(c.status, c.status === 'Needs review' ? 'warn' : c.status === 'Rejected' ? 'bad' : 'ok')}<br><span class="mut">by ${esc(c.created_by || 'n/a')}${c.reviewed_by ? ', reviewed by ' + esc(c.reviewed_by) : ''}</span>${c.flags.length ? '<br><span class="mut">' + esc(c.flags.join('; ')) + '</span>' : ''}</td><td>${a}${sp}</td></tr>`;
   }).join('');
   return `<h2>Ledger</h2><p class="mut">Claims, flags for review and weekly spot-checks.</p>
   <div class="k"><div><b>${sum.members}</b><span>Members</span></div><div><b>${sum.covered}</b><span>Covered now</span></div><div><b>${gh(sum.premiums)}</b><span>Premiums (member ${gh(sum.premiums_member)} + RUG ${gh(sum.premiums_subsidy)})</span></div><div><b>${gh(sum.claims_payable)}</b><span>Claims payable (${gh(sum.claims_paid)} paid)</span></div><div><b>${sum.claims_ratio == null ? 'n/a' : sum.claims_ratio + '%'}</b><span>Claims ratio</span></div></div>
-  <div class="card tw"><div class="bar"><button class="s" onclick="spotDraw(this)">Draw weekly spot-check</button><a class="s" href="/api/export/claims.csv">Export CSV</a></div>
+  <div class="card tw">${rv ? '<div class="bar"><button class="s" onclick="spotDraw(this)">Draw weekly spot-check</button><a class="s" href="/api/export/claims.csv">Export CSV</a></div>' : ''}
   <table><tr><th>ID</th><th>Member</th><th>Visit</th><th>Benefit</th><th>Payable</th><th>Status</th><th>Action</th></tr>${rows || '<tr><td colspan="7" class="mut">No claims yet.</td></tr>'}</table></div>`;
 }
 
+function vStaff() {
+  const roleSel = (u) => `<select onchange="editStaff(${u.id},{role:this.value},this)" aria-label="Role for ${esc(u.name)}"${u.id === ME.id ? ' disabled' : ''}>${Object.keys(LVL).map(r => `<option${r === u.role ? ' selected' : ''}>${r}</option>`).join('')}</select>`;
+  const rows = staff.map(u => `<tr><td>${esc(u.name)}<br><span class="mut">${esc(u.username)}</span></td><td>${roleSel(u)}</td>
+    <td>${u.active ? pill(u.must_change ? 'Temporary password' : 'Active', u.must_change ? 'warn' : 'ok') : pill('Disabled', 'bad')}</td>
+    <td>${u.id === ME.id ? '<span class="mut">You</span>' : `<button class="s" onclick="resetPw(${u.id},'${esc(u.name).replace(/'/g, '')}',this)">Reset password</button><button class="s ${u.active ? 'r' : ''}" onclick="editStaff(${u.id},{active:${!u.active}},this)">${u.active ? 'Disable' : 'Enable'}</button>`}</td></tr>`).join('');
+  const log = auditRows.slice(0, 100).map(a => `<tr><td>${esc(a.ts.replace('T', ' '))}</td><td>${esc(a.username || '')}</td><td>${esc(a.action.replace(/_/g, ' '))}</td><td>${esc(a.ref || '')} <span class="mut">${esc(a.detail || '')}</span></td></tr>`).join('');
+  return `<h2>Staff</h2><p class="mut">Desk staff enrol members, collect premiums and submit claims. Reviewers also approve, pay and spot-check claims, but never ones they submitted. Admins also manage staff.</p>
+  <div class="card"><div class="g"><label>Full name<input id="sn"></label><label>Username<input id="su" autocapitalize="none" placeholder="e.g. ama.m"></label>
+  <label>Role<select id="sr"><option value="desk">Desk</option><option value="reviewer">Reviewer</option><option value="admin">Admin</option></select></label><label>Temporary password<input id="sp" type="text" autocomplete="off"></label></div>
+  <button class="b" onclick="addStaff(this)">Add staff member</button></div>
+  <div class="card tw"><table><tr><th>Name</th><th>Role</th><th>Status</th><th>Action</th></tr>${rows}</table></div>
+  <h2>Activity log</h2><p class="mut">The latest 100 actions.</p><div class="card tw"><table><tr><th>When</th><th>Who</th><th>Action</th><th>Record</th></tr>${log || '<tr><td colspan="4" class="mut">Nothing yet.</td></tr>'}</table></div>`;
+}
+
 function render() {
-  if (!CFG) return;
-  $('#nav').innerHTML = T.map((t, i) => `<button class="${i === tab ? 'on' : ''}" onclick="go(${i})">${t}${i === 4 && sum.needs_review ? `<span class="n">${sum.needs_review}</span>` : ''}</button>`).join('');
-  $('#m').innerHTML = [vEnrol, vPay, vCheck, vClaim, vLedger][tab]();
+  if (!CFG || !ME) return;
+  if (tab === 5 && !can('admin')) tab = 0;
+  shell(true);
+  $('#nav').innerHTML = T.map((t, i) => i === 5 && !can('admin') ? '' : `<button class="${i === tab ? 'on' : ''}" onclick="go(${i})">${t}${i === 4 && sum.needs_review ? `<span class="n">${sum.needs_review}</span>` : ''}</button>`).join('');
+  $('#m').innerHTML = [vEnrol, vPay, vCheck, vClaim, vLedger, vStaff][tab]();
 }
 
 (async () => {
-  try {
-    CFG = await api('config');
-    $('#sub').textContent = 'Clinic desk, pilot' + (CFG.simulate ? '. Mobile money and SMS are simulated.' : '');
-    $('#foot').textContent = `Benefits per member per year: gap cover up to ${gh(CFG.gap_limit)}, hospital cash ${gh(CFG.cash_per_day)} a day for up to ${CFG.cash_max_days} days.`;
-    if (CFG.simulate) $('#demo').hidden = false;
-    $('#demo').addEventListener('click', e => { const a = e.target.dataset.act; if (a === 'seed') seed(e.target); if (a === 'reset') wipe(e.target); });
-    await load();
-  } catch (e) { $('#m').innerHTML = `<div class="card">${pill('Offline', 'bad')} <span class="mut">${esc(e.message)}</span></div>`; }
+  $('#demo').addEventListener('click', e => { const a = e.target.dataset.act; if (a === 'seed') seed(e.target); if (a === 'reset') wipe(e.target); });
+  try { ME = await api('me'); } catch (e) { return showLogin(); }
+  try { await start(); } catch (e) { $('#m').innerHTML = `<div class="card">${pill('Offline', 'bad')} <span class="mut">${esc(e.message)}</span></div>`; }
 })();

@@ -17,16 +17,45 @@ approved automatically.
 Benefit levels are illustrative. Set them with `CAIRE_PREMIUM`, `CAIRE_MEMBER_SHARE`, `CAIRE_SUBSIDY`,
 `CAIRE_COVER_DAYS`, `CAIRE_GAP_LIMIT`, `CAIRE_CASH_PER_DAY` and `CAIRE_CASH_MAX_DAYS`.
 
-## Run
+## Staff accounts
+
+Everyone signs in. Roles:
+
+| Role | Can |
+|---|---|
+| desk | enrol, collect premiums, check eligibility, submit claims, view the ledger |
+| reviewer | the above, plus approve/reject/mark paid, spot-checks, CSV export. Never on a claim they submitted |
+| admin | the above, plus add staff, change roles, reset passwords, disable accounts, view the activity log |
+
+The first admin is created on first start from `ADMIN_USERNAME` (default `admin`) and `ADMIN_PASSWORD`. Staff added by
+an admin get a temporary password and must set their own (8+ characters) when they first sign in. Five wrong passwords
+lock a username for 15 minutes. Disabling an account or resetting its password signs it out everywhere. Every change is
+recorded in the activity log (Staff tab).
+
+## Run locally
 
 ```bash
 pip install -r requirements.txt
-python app.py            # http://127.0.0.1:5000
-python -m pytest tests   # rule tests
+ADMIN_PASSWORD=choose-a-password python app.py   # http://127.0.0.1:5000, sign in as admin
+python -m pytest tests
 ```
 
-Data is stored in SQLite (`caire.db`, or the path in `CAIRE_DB`). For a server, use a WSGI host, e.g.
-`gunicorn "app:create_app()"`.
+Data is stored in SQLite (`caire.db`, or the path in `CAIRE_DB`).
+
+## Deploy on Render
+
+`render.yaml` is a Render Blueprint.
+
+1. Merge this work into `main` (Render deploys `main`).
+2. In Render: **New > Blueprint**, connect GitHub, pick this repo.
+3. When asked, enter `ADMIN_PASSWORD` (a strong password; this is the first admin login).
+4. Create. Render builds, attaches a 1 GB disk at `/var/data` for the database, generates `SECRET_KEY` and gives you
+   an `https://caire-cover.onrender.com`-style URL. Every push to `main` redeploys.
+5. Sign in as `admin`, open **Staff**, and add accounts for clinic staff.
+
+The disk needs a paid instance (Starter); the free plan has no disk, so data would be lost on every restart. Render
+snapshots disks daily. Keep one worker (`--workers 1`), as configured, while the app uses SQLite. A custom domain can
+be added under the service's Settings.
 
 ## Simulation mode
 
@@ -36,4 +65,3 @@ screen, the claim code is shown on a mock phone, and "Load sample data" / "Reset
 - set `CAIRE_SIMULATE=0`, which hides the code from the desk and disables seed/reset
 - connect `send_sms` in `app.py` to an SMS gateway
 - replace `POST /api/payments/<id>/approve|decline` with the mobile money provider's verified webhook
-- add staff login; the API has no authentication yet

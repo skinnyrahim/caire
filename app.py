@@ -4,6 +4,10 @@ Flask + SQLite. The clinic desk enrols members, collects premiums by mobile
 money, checks eligibility, captures OTP-confirmed claims and manages the
 claims ledger (review, payment, weekly spot-checks).
 
+Staff sign in with a role: desk (enrol, premiums, claims), reviewer (also
+approves, pays and spot-checks claims, but never their own) or admin (also
+manages staff). Every change is written to the audit log.
+
 Mobile money and SMS are simulated: the payment prompt is approved or declined
 from the desk screen, and the claim code is returned to the desk so it can be
 shown on a mock phone. Swap `send_sms` and the payment endpoints for real
@@ -18,7 +22,12 @@ import re
 import sqlite3
 from datetime import date, datetime, timedelta
 
-from flask import Flask, Response, g, jsonify, request
+import secrets
+import time
+from functools import wraps
+
+from flask import Flask, Response, g, jsonify, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Benefit levels are illustrative (GHS). Override with env vars for a pilot.
 CFG = {
@@ -54,7 +63,22 @@ CREATE TABLE IF NOT EXISTS claims(
   amount_billed INTEGER, days_requested INTEGER, days INTEGER NOT NULL DEFAULT 0,
   payable INTEGER NOT NULL, flags TEXT NOT NULL, status TEXT NOT NULL, spot TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+  role TEXT NOT NULL, pw_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  must_change INTEGER NOT NULL DEFAULT 1, pw_version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, username TEXT,
+  action TEXT NOT NULL, ref TEXT, detail TEXT);
 """
+
+# Columns added after the first release; created on start-up if missing.
+MIGRATIONS = [("members", "enrolled_by", "TEXT"), ("payments", "requested_by", "TEXT"),
+              ("pending_claims", "created_by", "TEXT"), ("claims", "created_by", "TEXT"),
+              ("claims", "reviewed_by", "TEXT")]
+
+ROLES = {"desk": 1, "reviewer": 2, "admin": 3}
+LOGIN_MAX_FAILS, LOGIN_LOCK_SECONDS = 5, 15 * 60
 
 TRANSITIONS = {"Needs review": {"Approved", "Rejected"}, "Approved": {"Paid", "Rejected"}}
 
@@ -71,6 +95,16 @@ def create_app(db_path=None, today=None):
     app.config["SIMULATE"] = os.environ.get("CAIRE_SIMULATE", "1") == "1"
     # `today` can be a callable returning a date, for tests.
     app.config["TODAY"] = today or date.today
+    app.config.update(
+        SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.environ.get("CAIRE_SECURE_COOKIES") == "1",
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    )
+    if not os.environ.get("SECRET_KEY"):
+        app.logger.warning("SECRET_KEY not set: staff will be signed out whenever the app restarts.")
+    fails = {}  # username -> recent failed login timestamps (single process)
 
     def db():
         if "db" not in g:
@@ -87,6 +121,17 @@ def create_app(db_path=None, today=None):
 
     with app.app_context():
         db().executescript(SCHEMA)
+        for table, col, typ in MIGRATIONS:
+            cols = [r[1] for r in db().execute(f"PRAGMA table_info({table})")]
+            if col not in cols:
+                db().execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        # First start: create the admin account from env vars.
+        au, ap = os.environ.get("ADMIN_USERNAME", "admin").strip().lower(), os.environ.get("ADMIN_PASSWORD")
+        if ap and not db().execute("SELECT 1 FROM users").fetchone():
+            db().execute(
+                "INSERT INTO users(username,name,role,pw_hash,must_change,created_at) VALUES(?,?,?,?,0,?)",
+                (au, "Administrator", "admin", generate_password_hash(ap), datetime.now().isoformat(timespec="seconds")))
+            app.logger.info("Created admin account '%s'.", au)
         db().commit()
 
     def td():
@@ -103,6 +148,58 @@ def create_app(db_path=None, today=None):
 
     def body():
         return request.get_json(silent=True) or {}
+
+    # ---------- staff auth ----------
+    PUBLIC = {"static", "index", "healthz", "login", "me", "logout"}
+    PW_CHANGE_OK = {"me", "logout", "change_password", "config"}
+
+    def current_user():
+        uid = session.get("uid")
+        if not uid:
+            return None
+        u = db().execute("SELECT * FROM users WHERE id=? AND active=1", (uid,)).fetchone()
+        if not u or u["pw_version"] != session.get("pv"):
+            session.clear()
+            return None
+        return u
+
+    def me_name():
+        return g.user["username"] if g.get("user") else None
+
+    def audit(action, ref=None, detail=None):
+        db().execute("INSERT INTO audit(ts,username,action,ref,detail) VALUES(?,?,?,?,?)",
+                     (now(), me_name(), action, ref, detail))
+
+    def role(min_role):
+        def deco(fn):
+            @wraps(fn)
+            def wrapped(*a, **kw):
+                if ROLES[g.user["role"]] < ROLES[min_role]:
+                    raise Bad("Your account does not have permission to do this.", 403)
+                return fn(*a, **kw)
+            return wrapped
+        return deco
+
+    def check_password(pw):
+        if len(pw or "") < 8:
+            raise Bad("Use a password of at least 8 characters.")
+
+    @app.before_request
+    def guard():
+        g.user = current_user()
+        if not request.path.startswith("/api/") or request.endpoint in PUBLIC:
+            return
+        if not g.user:
+            raise Bad("Please sign in.", 401)
+        # JSON-only writes: a cross-site form cannot send these, which blocks CSRF.
+        if request.method == "POST" and not request.is_json:
+            raise Bad("Send JSON.", 415)
+        if g.user["must_change"] and request.endpoint not in PW_CHANGE_OK:
+            raise Bad("Set a new password first.", 403)
+
+    def user_json(u):
+        return {"id": u["id"], "username": u["username"], "name": u["name"], "role": u["role"],
+                "active": bool(u["active"]), "must_change": bool(u["must_change"])}
 
     # ---------- domain helpers ----------
     def member(mid):
@@ -166,9 +263,10 @@ def create_app(db_path=None, today=None):
         seq = next_seq("members")
         mid = f"CC-{seq:04d}"
         db().execute(
-            "INSERT INTO members(id,seq,name,phone,ghana_card,nhis,enrolled_on,consent_at) VALUES(?,?,?,?,?,?,?,?)",
-            (mid, seq, name, phone, card, nhis, td().isoformat(), now()),
+            "INSERT INTO members(id,seq,name,phone,ghana_card,nhis,enrolled_on,consent_at,enrolled_by) VALUES(?,?,?,?,?,?,?,?,?)",
+            (mid, seq, name, phone, card, nhis, td().isoformat(), now(), me_name()),
         )
+        audit("member_enrolled", mid)
         return mid
 
     def do_approve(pid):
@@ -186,6 +284,7 @@ def create_app(db_path=None, today=None):
             "UPDATE payments SET status='approved', settled_at=?, cover_from=?, cover_to=? WHERE id=?",
             (now(), start.isoformat(), end.isoformat(), pid),
         )
+        audit("payment_approved", p["member_id"], f"payment {pid}, cover to {end.isoformat()}")
         return end
 
     # ---------- errors ----------
@@ -197,6 +296,116 @@ def create_app(db_path=None, today=None):
     @app.get("/")
     def index():
         return app.send_static_file("index.html")
+
+    @app.get("/healthz")
+    def healthz():
+        db().execute("SELECT 1")
+        return "ok"
+
+    @app.post("/api/login")
+    def login():
+        if not request.is_json:
+            raise Bad("Send JSON.", 415)
+        b = body()
+        un = (b.get("username") or "").strip().lower()
+        t = time.time()
+        recent = [x for x in fails.get(un, []) if t - x < LOGIN_LOCK_SECONDS]
+        if len(recent) >= LOGIN_MAX_FAILS:
+            raise Bad("Too many failed attempts. Try again in 15 minutes.", 429)
+        u = db().execute("SELECT * FROM users WHERE username=? AND active=1", (un,)).fetchone()
+        if not u or not check_password_hash(u["pw_hash"], b.get("password") or ""):
+            fails[un] = recent + [t]
+            raise Bad("Wrong username or password.", 401)
+        fails.pop(un, None)
+        session.clear()
+        session.permanent = True
+        session["uid"], session["pv"] = u["id"], u["pw_version"]
+        g.user = u
+        audit("login")
+        db().commit()
+        return jsonify(user_json(u))
+
+    @app.post("/api/logout")
+    def logout():
+        session.clear()
+        return jsonify({"ok": True})
+
+    @app.get("/api/me")
+    def me():
+        if not g.user:
+            raise Bad("Please sign in.", 401)
+        return jsonify(user_json(g.user))
+
+    @app.post("/api/me/password")
+    def change_password():
+        b = body()
+        if not check_password_hash(g.user["pw_hash"], b.get("current") or ""):
+            raise Bad("Your current password is wrong.")
+        check_password(b.get("new"))
+        if b.get("new") == b.get("current"):
+            raise Bad("Choose a password different from the current one.")
+        pv = g.user["pw_version"] + 1
+        db().execute("UPDATE users SET pw_hash=?, must_change=0, pw_version=? WHERE id=?",
+                     (generate_password_hash(b["new"]), pv, g.user["id"]))
+        session["pv"] = pv
+        audit("password_changed", g.user["username"])
+        db().commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/staff")
+    @role("admin")
+    def staff():
+        return jsonify([user_json(u) for u in db().execute("SELECT * FROM users ORDER BY name").fetchall()])
+
+    @app.post("/api/staff")
+    @role("admin")
+    def add_staff():
+        b = body()
+        un = (b.get("username") or "").strip().lower()
+        name = (b.get("name") or "").strip()
+        if not re.fullmatch(r"[a-z0-9._-]{3,32}", un) or not name:
+            raise Bad("Enter a name and a username of 3 to 32 letters, numbers, dots or dashes.")
+        if b.get("role") not in ROLES:
+            raise Bad("Pick a role.")
+        check_password(b.get("password"))
+        if db().execute("SELECT 1 FROM users WHERE username=?", (un,)).fetchone():
+            raise Bad("That username is taken.", 409)
+        cur = db().execute("INSERT INTO users(username,name,role,pw_hash,created_at) VALUES(?,?,?,?,?)",
+                           (un, name, b["role"], generate_password_hash(b["password"]), now()))
+        audit("staff_added", un, b["role"])
+        db().commit()
+        return jsonify(user_json(db().execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone())), 201
+
+    @app.post("/api/staff/<int:uid>")
+    @role("admin")
+    def edit_staff(uid):
+        b = body()
+        u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not u:
+            raise Bad("Staff account not found.", 404)
+        if uid == g.user["id"] and (("active" in b and not b["active"]) or b.get("role", "admin") != "admin"):
+            raise Bad("You cannot disable or demote your own account.")
+        if "role" in b:
+            if b["role"] not in ROLES:
+                raise Bad("Pick a role.")
+            db().execute("UPDATE users SET role=? WHERE id=?", (b["role"], uid))
+            audit("staff_role", u["username"], b["role"])
+        if "active" in b:
+            db().execute("UPDATE users SET active=? WHERE id=?", (1 if b["active"] else 0, uid))
+            audit("staff_enabled" if b["active"] else "staff_disabled", u["username"])
+        if b.get("password"):
+            check_password(b["password"])
+            db().execute("UPDATE users SET pw_hash=?, must_change=1, pw_version=pw_version+1 WHERE id=?",
+                         (generate_password_hash(b["password"]), uid))
+            audit("staff_password_reset", u["username"])
+        db().commit()
+        return jsonify(user_json(db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()))
+
+    @app.get("/api/audit")
+    @role("admin")
+    def audit_log():
+        rows = db().execute("SELECT * FROM audit ORDER BY id DESC LIMIT 300").fetchall()
+        return jsonify([dict(r) for r in rows])
 
     @app.get("/api/config")
     def config():
@@ -241,8 +450,8 @@ def create_app(db_path=None, today=None):
             raise Bad("Pick a mobile money network.")
         db().execute("UPDATE payments SET status='expired' WHERE member_id=? AND status='pending'", (m["id"],))
         cur = db().execute(
-            "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at) VALUES(?,?,?,?, 'pending', ?)",
-            (m["id"], net, CFG["member_share"], CFG["subsidy"], now()),
+            "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at,requested_by) VALUES(?,?,?,?, 'pending', ?, ?)",
+            (m["id"], net, CFG["member_share"], CFG["subsidy"], now(), me_name()),
         )
         db().commit()
         return jsonify({"id": cur.lastrowid, "member_id": m["id"], "member_name": m["name"],
@@ -252,6 +461,8 @@ def create_app(db_path=None, today=None):
     # from the provider's webhook after verifying its signature.
     @app.post("/api/payments/<int:pid>/<action>")
     def settle_payment(pid, action):
+        if not app.config["SIMULATE"]:
+            raise Bad("Payments are confirmed by the mobile money provider.", 403)
         if action == "approve":
             end = do_approve(pid)
             db().commit()
@@ -261,6 +472,7 @@ def create_app(db_path=None, today=None):
                              (now(), pid)).rowcount
             if not n:
                 raise Bad("This payment prompt is no longer pending.", 409)
+            audit("payment_declined", None, f"payment {pid}")
             db().commit()
             return jsonify({"status": "declined"})
         raise Bad("Unknown action.", 404)
@@ -319,8 +531,8 @@ def create_app(db_path=None, today=None):
             data.update(days=days)
         otp = f"{random.SystemRandom().randint(1000, 9999)}"
         exp = (datetime.now() + timedelta(minutes=CFG["otp_minutes"])).isoformat(timespec="seconds")
-        cur = db().execute("INSERT INTO pending_claims(data,otp,expires_at) VALUES(?,?,?)",
-                           (json.dumps(data), otp, exp))
+        cur = db().execute("INSERT INTO pending_claims(data,otp,expires_at,created_by) VALUES(?,?,?,?)",
+                           (json.dumps(data), otp, exp, me_name()))
         db().commit()
         send_sms(m["phone"], f"CAIRE Cover: your code to confirm today's visit is {otp}. "
                              "Share it only if you are at the clinic.")
@@ -377,11 +589,12 @@ def create_app(db_path=None, today=None):
         cid = f"CL-{seq:04d}"
         status = "Needs review" if flags else "Approved"
         db().execute(
-            "INSERT INTO claims(id,seq,member_id,visit_date,type,diagnosis,services,amount_billed,days_requested,days,payable,flags,status,created_at,updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO claims(id,seq,member_id,visit_date,type,diagnosis,services,amount_billed,days_requested,days,payable,flags,status,created_at,updated_at,created_by)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (cid, seq, d["member_id"], d["visit_date"], d["type"], d["diagnosis"], d.get("services"),
-             d.get("amount"), d.get("days"), days, payable, json.dumps(flags), status, now(), now()),
+             d.get("amount"), d.get("days"), days, payable, json.dumps(flags), status, now(), now(), p["created_by"]),
         )
+        audit("claim_submitted", cid, f"{status}, GHS {payable}")
         db().execute("DELETE FROM pending_claims WHERE id=?", (p["id"],))
         db().commit()
         return jsonify(claim_json(db().execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone())), 201
@@ -398,16 +611,21 @@ def create_app(db_path=None, today=None):
         return r
 
     @app.post("/api/claims/<cid>/status")
+    @role("reviewer")
     def set_status(cid):
         c = get_claim(cid)
         s = body().get("status")
         if s not in TRANSITIONS.get(c["status"], set()):
             raise Bad(f"A claim that is '{c['status']}' cannot be set to '{s}'.", 409)
-        db().execute("UPDATE claims SET status=?, updated_at=? WHERE id=?", (s, now(), cid))
+        if c["created_by"] and c["created_by"] == me_name():
+            raise Bad("You submitted this claim, so another reviewer must decide it.", 403)
+        db().execute("UPDATE claims SET status=?, reviewed_by=?, updated_at=? WHERE id=?", (s, me_name(), now(), cid))
+        audit("claim_" + s.lower(), cid)
         db().commit()
         return jsonify(claim_json(get_claim(cid)))
 
     @app.post("/api/spotchecks/draw")
+    @role("reviewer")
     def spot_draw():
         n = int(body().get("count") or 2)
         rows = db().execute(
@@ -416,10 +634,12 @@ def create_app(db_path=None, today=None):
         pick = random.sample([r["id"] for r in rows], min(n, len(rows)))
         for cid in pick:
             db().execute("UPDATE claims SET spot='pending', updated_at=? WHERE id=?", (now(), cid))
+            audit("spotcheck_drawn", cid)
         db().commit()
         return jsonify({"picked": pick})
 
     @app.post("/api/claims/<cid>/spot")
+    @role("reviewer")
     def spot_result(cid):
         c = get_claim(cid)
         v = body().get("result")
@@ -434,6 +654,7 @@ def create_app(db_path=None, today=None):
                 flags.append("Already paid: recover from clinic if confirmed false")
         db().execute("UPDATE claims SET spot=?, status=?, flags=?, updated_at=? WHERE id=?",
                      (v, status, json.dumps(flags), now(), cid))
+        audit("spotcheck_" + v, cid)
         db().commit()
         return jsonify(claim_json(get_claim(cid)))
 
@@ -454,11 +675,12 @@ def create_app(db_path=None, today=None):
         })
 
     @app.get("/api/export/claims.csv")
+    @role("reviewer")
     def export_claims():
         buf = io.StringIO()
         w = csv.writer(buf)
         cols = ["id", "member_id", "member_name", "visit_date", "type", "diagnosis", "services",
-                "amount_billed", "days", "payable", "status", "flags", "spot", "created_at"]
+                "amount_billed", "days", "payable", "status", "flags", "spot", "created_at", "created_by", "reviewed_by"]
         w.writerow(cols)
         for r in db().execute("SELECT * FROM claims ORDER BY seq").fetchall():
             c = claim_json(r)
@@ -468,6 +690,7 @@ def create_app(db_path=None, today=None):
                         headers={"Content-Disposition": "attachment; filename=caire-claims.csv"})
 
     @app.post("/api/demo/seed")
+    @role("admin")
     def seed():
         if not app.config["SIMULATE"]:
             raise Bad("Sample data is only available in simulation mode.", 403)
@@ -487,11 +710,13 @@ def create_app(db_path=None, today=None):
         return jsonify({"added": added})
 
     @app.post("/api/demo/reset")
+    @role("admin")
     def reset():
         if not app.config["SIMULATE"]:
             raise Bad("Reset is only available in simulation mode.", 403)
         for t in ("claims", "pending_claims", "payments", "members"):
             db().execute(f"DELETE FROM {t}")
+        audit("demo_reset")
         db().commit()
         return jsonify({"ok": True})
 
