@@ -21,11 +21,14 @@ function toast(t) {
 }
 
 async function api(path, body, method) {
-  const r = await fetch('/api/' + path, {
-    method: method || (body !== undefined ? 'POST' : 'GET'),
-    headers: body !== undefined ? {'Content-Type': 'application/json'} : {},
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let r;
+  try {
+    r = await fetch('/api/' + path, {
+      method: method || (body !== undefined ? 'POST' : 'GET'),
+      headers: body !== undefined ? {'Content-Type': 'application/json'} : {},
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) { throw new Error('No internet connection. Check the connection and try again.'); }
   let d = null; try { d = await r.json(); } catch (e) {}
   if (r.status === 401 && path !== 'login' && path !== 'me') { ME = null; showLogin(); }
   if (!r.ok) throw new Error((d && d.error) || 'Something went wrong. Try again.');
@@ -257,6 +260,19 @@ function render() {
 
 (async () => {
   $('#demo').addEventListener('click', e => { const a = e.target.dataset.act; if (a === 'seed') seed(e.target); if (a === 'reset') wipe(e.target); });
-  try { ME = await api('me'); } catch (e) { return showLogin(); }
+  try { ME = await api('me'); } catch (e) {
+    if (/internet/.test(e.message)) return $('#m').innerHTML = `<div class="card">${pill('Offline', 'bad')} <span class="mut">${esc(e.message)}</span></div>`;
+    return showLogin();
+  }
   try { await start(); } catch (e) { $('#m').innerHTML = `<div class="card">${pill('Offline', 'bad')} <span class="mut">${esc(e.message)}</span></div>`; }
 })();
+
+// ---------- installable app ----------
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+let installEvt = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; $('#install').hidden = false; });
+$('#install').addEventListener('click', async () => {
+  if (!installEvt) return;
+  installEvt.prompt(); await installEvt.userChoice; installEvt = null; $('#install').hidden = true;
+});
+window.addEventListener('appinstalled', () => { $('#install').hidden = true; toast('CAIRE Cover is installed. Open it from your home screen.'); });

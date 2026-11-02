@@ -5,6 +5,7 @@
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,sans-serif;padding-bottom:env(safe-area-inset-bottom,0px)}
 header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px;padding-top:calc(14px + env(safe-area-inset-top,0px));display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
 header b{font-size:18px;color:var(--acc)}header span{color:var(--mut);font-size:13px}
+header #install{margin:0}
 header #who{margin-left:auto;color:var(--ink)}header #who .s{margin:0 0 0 6px}
 td select{min-width:110px;margin-top:0}
 [hidden]{display:none!important}
