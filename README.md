@@ -40,22 +40,51 @@ ADMIN_PASSWORD=choose-a-password python app.py   # http://127.0.0.1:5000, sign i
 python -m pytest tests
 ```
 
-Data is stored in SQLite (`caire.db`, or the path in `CAIRE_DB`).
+Locally, data is stored in SQLite (`caire.db`, or the path in `CAIRE_DB`). When `DATABASE_URL` is set, the app uses
+that Postgres database instead.
+
+To also run the tests on Postgres, point `CAIRE_TEST_PG_URL` at an empty, throwaway database (the tests wipe it):
+`CAIRE_TEST_PG_URL=postgresql://user@localhost/caire_test python -m pytest tests`.
 
 ## Deploy on Render
 
-`render.yaml` is a Render Blueprint.
+`render.yaml` is a Render Blueprint: a web service plus a Render Postgres database (`caire-db`) in the same region.
 
-1. Merge this work into `main` (Render deploys `main`).
-2. In Render: **New > Blueprint**, connect GitHub, pick this repo.
-3. When asked, enter `ADMIN_PASSWORD` (a strong password; this is the first admin login).
-4. Create. Render builds, attaches a 1 GB disk at `/var/data` for the database, generates `SECRET_KEY` and gives you
-   an `https://caire-cover.onrender.com`-style URL. Every push to `main` redeploys.
-5. Sign in as `admin`, open **Staff**, and add accounts for clinic staff.
+1. In Render: **New > Blueprint**, connect GitHub, pick this repo.
+2. When asked, enter `ADMIN_PASSWORD` (a strong password; this is the first admin login).
+3. Create. Render creates the database, builds the app, connects them over Render's private network
+   (`DATABASE_URL`), generates `SECRET_KEY` and gives you an `https://caire-cover.onrender.com`-style URL. Every push to
+   `main` redeploys.
+4. Sign in as `admin`, open **Staff**, and add accounts for clinic staff.
 
-The disk needs a paid instance (Starter); the free plan has no disk, so data would be lost on every restart. Render
-snapshots disks daily. Keep one worker (`--workers 1`), as configured, while the app uses SQLite. A custom domain can
-be added under the service's Settings.
+The database only accepts connections from Render services, not from the internet. Paid Render Postgres plans include
+automatic backups (restore them from the database's **Recovery** page); free databases expire after 30 days, so don't
+use one for real data. To copy the data elsewhere, allow your IP address in the database's access control settings, then
+run `pg_dump` with the database's external connection URL.
+
+### Moving existing data from the SQLite disk
+
+If the service ran on SQLite before Postgres was added, copy that data across once, from the service's **Shell** tab:
+
+```bash
+python scripts/sqlite_to_postgres.py /var/data/caire.db            # shows row counts, copies nothing
+python scripts/sqlite_to_postgres.py /var/data/caire.db --replace  # copies everything
+```
+
+`--replace` empties Postgres first (including the admin account created on first start), so staff sign in with their
+old passwords afterwards. It runs in one transaction. Once you have checked the data in the app, delete the `disk:`
+block from `render.yaml`.
+
+## Install as an app
+
+CAIRE Cover is an installable web app (PWA). Once it is live on its `https://` address:
+
+- **Android (Chrome):** open the link, tap **Install app** in the header, or the ⋮ menu > **Install app** / **Add to Home screen**.
+- **iPhone/iPad (Safari):** open the link, tap **Share** > **Add to Home Screen**.
+- **Windows/Mac (Chrome or Edge):** click the install icon at the right of the address bar.
+
+It then opens full-screen from its own icon. Updates arrive automatically on the next launch. Screens open on a
+weak connection, but enrolling, payments and claims need the internet; member data is never stored on the device.
 
 ## Install as an app
 

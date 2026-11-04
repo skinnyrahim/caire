@@ -1,18 +1,36 @@
+import os
+import threading
 from datetime import date, timedelta
 
 import pytest
 
-from app import CFG, create_app
+from app import CFG, connect, create_app
 
 TODAY = date(2026, 6, 15)
+# Set to an empty, throwaway Postgres database to also run every test on Postgres.
+PG_URL = os.environ.get("CAIRE_TEST_PG_URL")
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def db_url(request, tmp_path):
+    if request.param == "sqlite":
+        return str(tmp_path / "t.db")
+    if not PG_URL:
+        pytest.skip("CAIRE_TEST_PG_URL not set")
+    c = connect(PG_URL)
+    c.execute("DROP SCHEMA public CASCADE")
+    c.execute("CREATE SCHEMA public")
+    c.commit()
+    c.close()
+    return PG_URL
 
 
 @pytest.fixture
-def app(tmp_path, monkeypatch):
+def app(db_url, monkeypatch):
     monkeypatch.setenv("ADMIN_USERNAME", "admin")
     monkeypatch.setenv("ADMIN_PASSWORD", "admin-pass-1")
     clock = {"d": TODAY}
-    a = create_app(str(tmp_path / "t.db"), today=lambda: clock["d"])
+    a = create_app(db_url, today=lambda: clock["d"])
     a.config["SIMULATE"] = True
     a.clock = clock
     return a
@@ -233,3 +251,29 @@ def test_password_reset_signs_out_old_sessions(app, client):
     client.post(f"/api/staff/{uid}", json={"password": "new-temp-pass"})
     assert d.get("/api/me").status_code == 401
     assert login(app, "dora", "new-temp-pass").get("/api/me").json["must_change"] is True
+
+
+def test_ids_unique_under_concurrent_enrolment(app, client):
+    """Two desks enrolling at the same moment must not get the same member ID."""
+    errors = []
+
+    def go(i):
+        r = client.application.test_client()
+        with r.session_transaction() as sess, client.session_transaction() as mine:
+            sess.update(mine)
+        res = r.post("/api/members", json={"name": f"M{i}", "phone": f"02400000{i:02d}", "consent": True})
+        if res.status_code != 201:
+            errors.append(res.json)
+
+    ts = [threading.Thread(target=go, args=(i,)) for i in range(12)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    ids = [m["id"] for m in client.get("/api/members").json]
+    assert not errors and len(ids) == 12 and len(set(ids)) == 12
+    assert sorted(ids)[-1] == "CC-0012"
+
+
+def test_reset_restarts_numbering(client):
+    enrol(client)
+    client.post("/api/demo/reset", json={})
+    assert enrol(client, phone="0209998877") == "CC-0001"

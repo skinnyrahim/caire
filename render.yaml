@@ -1,16 +1,20 @@
 # Render Blueprint: Dashboard > New > Blueprint, then pick this repo.
+# Changes to this file are applied from the Blueprint's page ("Manual sync" if
+# auto-sync is off).
 services:
   - type: web
     name: caire-cover
     runtime: python
-    plan: starter            # a persistent disk needs a paid instance
-    region: frankfurt        # closest Render region to Ghana
+    plan: starter
+    region: frankfurt        # closest Render region to Ghana; must match the database
     branch: main
     buildCommand: pip install -r requirements.txt
-    # One worker: SQLite and the login lockout counter live in one process.
+    # One worker: the login lockout counter lives in one process.
     startCommand: gunicorn "app:create_app()" --workers 1 --threads 8 --bind 0.0.0.0:$PORT --access-logfile -
     healthCheckPath: /healthz
     autoDeploy: true
+    # Holds the old SQLite file (/var/data/caire.db). Once its data has been
+    # copied to Postgres (see README), this disk block can be deleted.
     disk:
       name: caire-data
       mountPath: /var/data
@@ -18,8 +22,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
-      - key: CAIRE_DB
-        value: /var/data/caire.db
+      - key: DATABASE_URL
+        fromDatabase:
+          name: caire-db
+          property: connectionString   # private network address
       - key: CAIRE_SIMULATE
         value: "1"           # demo mode; set to 0 once real SMS and mobile money are connected
       - key: CAIRE_SECURE_COOKIES
@@ -30,3 +36,12 @@ services:
         value: admin
       - key: ADMIN_PASSWORD
         sync: false          # Render asks for this when you create the Blueprint
+
+databases:
+  - name: caire-db
+    databaseName: caire
+    user: caire
+    plan: basic-256mb        # paid: daily backups, no expiry (free databases are deleted after 30 days)
+    region: frankfurt
+    postgresMajorVersion: "16"
+    ipAllowList: []          # no access from the internet; only Render services can connect
