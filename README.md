@@ -86,6 +86,17 @@ CAIRE Cover is an installable web app (PWA). Once it is live on its `https://` a
 It then opens full-screen from its own icon. Updates arrive automatically on the next launch. Screens open on a
 weak connection, but enrolling, payments and claims need the internet; member data is never stored on the device.
 
+## Install as an app
+
+CAIRE Cover is an installable web app (PWA). Once it is live on its `https://` address:
+
+- **Android (Chrome):** open the link, tap **Install app** in the header, or the ⋮ menu > **Install app** / **Add to Home screen**.
+- **iPhone/iPad (Safari):** open the link, tap **Share** > **Add to Home Screen**.
+- **Windows/Mac (Chrome or Edge):** click the install icon at the right of the address bar.
+
+It then opens full-screen from its own icon. Updates arrive automatically on the next launch. Screens open on a
+weak connection, but enrolling, payments and claims need the internet; member data is never stored on the device.
+
 ## Simulation mode
 
 `CAIRE_SIMULATE=1` (the default) is for demos and training: the mobile money prompt is approved or declined on the desk
