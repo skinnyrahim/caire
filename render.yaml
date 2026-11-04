@@ -27,7 +27,7 @@ services:
           name: caire-db
           property: connectionString   # private network address
       - key: CAIRE_SIMULATE
-        value: "1"           # demo mode; set to 0 once real SMS and mobile money are connected
+        value: "1"           # 1 = channels without a key are simulated, plus demo tools; 0 = never simulate
       - key: CAIRE_SECURE_COOKIES
         value: "1"
       - key: SECRET_KEY
@@ -36,6 +36,11 @@ services:
         value: admin
       - key: ADMIN_PASSWORD
         sync: false          # Render asks for this when you create the Blueprint
+      # Real mobile money and SMS: add these in the service's Environment tab (see README).
+      #   PAYSTACK_SECRET_KEY   sk_test_... to try, sk_live_... for real money
+      #   ARKESEL_API_KEY       from Arkesel > SMS API
+      #   ARKESEL_SENDER        approved sender ID, max 11 characters (default CAIRE)
+      #   PAYSTACK_EMAIL_DOMAIN optional; members' Paystack emails are <member-id>@<domain>
 
 databases:
   - name: caire-db
