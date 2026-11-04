@@ -1,6 +1,7 @@
 """CAIRE Cover: clinic-desk app for a micro health cover pilot.
 
-Flask + SQLite. The clinic desk enrols members, collects premiums by mobile
+Flask + Postgres (DATABASE_URL) or SQLite (CAIRE_DB, for local use and tests).
+The clinic desk enrols members, collects premiums by mobile
 money, checks eligibility, captures OTP-confirmed claims and manages the
 claims ledger (review, payment, weekly spot-checks).
 
@@ -70,12 +71,74 @@ CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, username TEXT,
   action TEXT NOT NULL, ref TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, n INTEGER NOT NULL);
 """
 
 # Columns added after the first release; created on start-up if missing.
 MIGRATIONS = [("members", "enrolled_by", "TEXT"), ("payments", "requested_by", "TEXT"),
               ("pending_claims", "created_by", "TEXT"), ("claims", "created_by", "TEXT"),
               ("claims", "reviewed_by", "TEXT")]
+
+class Row(dict):
+    """Result row readable by column name or position, like sqlite3.Row."""
+
+    def __getitem__(self, k):
+        return self._v[k] if isinstance(k, int) else dict.__getitem__(self, k)
+
+
+def _pg_rows(cursor):
+    cols = [d.name for d in cursor.description] if cursor.description else []
+
+    def make(values):
+        r = Row(zip(cols, values))
+        r._v = values
+        return r
+    return make
+
+
+class PgDB:
+    """A psycopg connection that runs the app's SQLite-style queries (? placeholders)."""
+
+    def __init__(self, url):
+        import psycopg
+        self.c = psycopg.connect(url, row_factory=_pg_rows)
+
+    def execute(self, sql, params=()):
+        return self.c.execute(sql.replace("?", "%s"), params)
+
+    def commit(self):
+        self.c.commit()
+
+    def close(self):
+        self.c.close()
+
+
+def is_pg(url):
+    return url.startswith(("postgres://", "postgresql://"))
+
+
+def connect(url):
+    if is_pg(url):
+        return PgDB(url)
+    c = sqlite3.connect(url)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
+
+
+def init_schema(c, pg):
+    for stmt in SCHEMA.split(";"):
+        if stmt.strip():
+            c.execute(stmt.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY") if pg else stmt)
+    for table, col, typ in MIGRATIONS:
+        if pg:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
+        elif col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    for table in ("members", "claims"):
+        c.execute(f"INSERT INTO counters(name,n) SELECT ?, COALESCE(MAX(seq),0) FROM {table} WHERE true "
+                  "ON CONFLICT(name) DO NOTHING", (table,))
+
 
 ROLES = {"desk": 1, "reviewer": 2, "admin": 3}
 LOGIN_MAX_FAILS, LOGIN_LOCK_SECONDS = 5, 15 * 60
@@ -91,7 +154,7 @@ class Bad(Exception):
 
 def create_app(db_path=None, today=None):
     app = Flask(__name__, static_folder="static", static_url_path="")
-    app.config["DB"] = db_path or os.environ.get("CAIRE_DB", "caire.db")
+    app.config["DB"] = db_path or os.environ.get("DATABASE_URL") or os.environ.get("CAIRE_DB", "caire.db")
     app.config["SIMULATE"] = os.environ.get("CAIRE_SIMULATE", "1") == "1"
     # `today` can be a callable returning a date, for tests.
     app.config["TODAY"] = today or date.today
@@ -108,9 +171,7 @@ def create_app(db_path=None, today=None):
 
     def db():
         if "db" not in g:
-            g.db = sqlite3.connect(app.config["DB"])
-            g.db.row_factory = sqlite3.Row
-            g.db.execute("PRAGMA foreign_keys=ON")
+            g.db = connect(app.config["DB"])
         return g.db
 
     @app.teardown_appcontext
@@ -120,11 +181,7 @@ def create_app(db_path=None, today=None):
             c.close()
 
     with app.app_context():
-        db().executescript(SCHEMA)
-        for table, col, typ in MIGRATIONS:
-            cols = [r[1] for r in db().execute(f"PRAGMA table_info({table})")]
-            if col not in cols:
-                db().execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        init_schema(db(), is_pg(app.config["DB"]))
         # First start: create the admin account from env vars.
         au, ap = os.environ.get("ADMIN_USERNAME", "admin").strip().lower(), os.environ.get("ADMIN_PASSWORD")
         if ap and not db().execute("SELECT 1 FROM users").fetchone():
@@ -247,7 +304,8 @@ def create_app(db_path=None, today=None):
         return d
 
     def next_seq(table):
-        return db().execute(f"SELECT COALESCE(MAX(seq),0)+1 FROM {table}").fetchone()[0]
+        # Atomic: the row lock holds concurrent requests until this one commits.
+        return db().execute("UPDATE counters SET n=n+1 WHERE name=? RETURNING n", (table,)).fetchone()[0]
 
     def norm_phone(p):
         p = re.sub(r"\D", "", p or "")
@@ -370,11 +428,11 @@ def create_app(db_path=None, today=None):
         check_password(b.get("password"))
         if db().execute("SELECT 1 FROM users WHERE username=?", (un,)).fetchone():
             raise Bad("That username is taken.", 409)
-        cur = db().execute("INSERT INTO users(username,name,role,pw_hash,created_at) VALUES(?,?,?,?,?)",
-                           (un, name, b["role"], generate_password_hash(b["password"]), now()))
+        new_id = db().execute("INSERT INTO users(username,name,role,pw_hash,created_at) VALUES(?,?,?,?,?) RETURNING id",
+                              (un, name, b["role"], generate_password_hash(b["password"]), now())).fetchone()[0]
         audit("staff_added", un, b["role"])
         db().commit()
-        return jsonify(user_json(db().execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone())), 201
+        return jsonify(user_json(db().execute("SELECT * FROM users WHERE id=?", (new_id,)).fetchone())), 201
 
     @app.post("/api/staff/<int:uid>")
     @role("admin")
@@ -449,12 +507,12 @@ def create_app(db_path=None, today=None):
         if net not in CFG["networks"]:
             raise Bad("Pick a mobile money network.")
         db().execute("UPDATE payments SET status='expired' WHERE member_id=? AND status='pending'", (m["id"],))
-        cur = db().execute(
-            "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at,requested_by) VALUES(?,?,?,?, 'pending', ?, ?)",
+        pid = db().execute(
+            "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at,requested_by) VALUES(?,?,?,?, 'pending', ?, ?) RETURNING id",
             (m["id"], net, CFG["member_share"], CFG["subsidy"], now(), me_name()),
-        )
+        ).fetchone()[0]
         db().commit()
-        return jsonify({"id": cur.lastrowid, "member_id": m["id"], "member_name": m["name"],
+        return jsonify({"id": pid, "member_id": m["id"], "member_name": m["name"],
                         "phone": m["phone"], "network": net, "amount": CFG["member_share"]}), 201
 
     # Simulated mobile money callback. A real integration would call this
@@ -531,12 +589,12 @@ def create_app(db_path=None, today=None):
             data.update(days=days)
         otp = f"{random.SystemRandom().randint(1000, 9999)}"
         exp = (datetime.now() + timedelta(minutes=CFG["otp_minutes"])).isoformat(timespec="seconds")
-        cur = db().execute("INSERT INTO pending_claims(data,otp,expires_at,created_by) VALUES(?,?,?,?)",
-                           (json.dumps(data), otp, exp, me_name()))
+        pending_id = db().execute("INSERT INTO pending_claims(data,otp,expires_at,created_by) VALUES(?,?,?,?) RETURNING id",
+                                  (json.dumps(data), otp, exp, me_name())).fetchone()[0]
         db().commit()
         send_sms(m["phone"], f"CAIRE Cover: your code to confirm today's visit is {otp}. "
                              "Share it only if you are at the clinic.")
-        out = {"pending_id": cur.lastrowid, "member_name": m["name"], "phone": m["phone"], **data}
+        out = {"pending_id": pending_id, "member_name": m["name"], "phone": m["phone"], **data}
         if app.config["SIMULATE"]:
             out["simulated_code"] = otp
         return jsonify(out), 201
@@ -702,10 +760,10 @@ def create_app(db_path=None, today=None):
             mid = do_enrol(n, p)
             added.append(mid)
             if i < 2:
-                cur = db().execute(
-                    "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at) VALUES(?,?,?,?,'pending',?)",
-                    (mid, "MTN MoMo", CFG["member_share"], CFG["subsidy"], now()))
-                do_approve(cur.lastrowid)
+                pid = db().execute(
+                    "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at) VALUES(?,?,?,?,'pending',?) RETURNING id",
+                    (mid, "MTN MoMo", CFG["member_share"], CFG["subsidy"], now())).fetchone()[0]
+                do_approve(pid)
         db().commit()
         return jsonify({"added": added})
 
@@ -716,6 +774,7 @@ def create_app(db_path=None, today=None):
             raise Bad("Reset is only available in simulation mode.", 403)
         for t in ("claims", "pending_claims", "payments", "members"):
             db().execute(f"DELETE FROM {t}")
+        db().execute("UPDATE counters SET n=0")
         audit("demo_reset")
         db().commit()
         return jsonify({"ok": True})
