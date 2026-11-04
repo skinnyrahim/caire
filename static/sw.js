@@ -1,7 +1,7 @@
 // CAIRE Cover service worker: makes the app installable and lets the screens
 // open on a weak connection. Member data (/api) is never cached.
-const CACHE = 'caire-shell-v1';
-const SHELL = ['/', '/app.js', '/style.css', '/manifest.json', '/icons/icon-192.png', '/icons/icon.svg'];
+const CACHE = 'caire-shell-v2';
+const SHELL = ['/', '/app.js', '/style.css', '/manifest.json', '/icons/icon-192.png', '/icons/mark.png', '/icons/logo.png', '/icons/favicon-32.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));

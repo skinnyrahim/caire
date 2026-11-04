@@ -3,8 +3,10 @@
 :root[data-theme="dark"]{--bg:#10161c;--card:#18212a;--ink:#e8edf2;--mut:#98a6b3;--line:#2a3541;--acc:#6bb3ea;--accI:#06233a;--soft:#1b2b3a;--ok:#5fcf98;--warn:#f0b35c;--bad:#ff8a80}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,sans-serif;padding-bottom:env(safe-area-inset-bottom,0px)}
-header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px;padding-top:calc(14px + env(safe-area-inset-top,0px));display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
-header b{font-size:18px;color:var(--acc)}header span{color:var(--mut);font-size:13px}
+header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px;padding-top:calc(14px + env(safe-area-inset-top,0px));display:flex;gap:10px 12px;align-items:center;flex-wrap:wrap}
+header .mark{align-self:center;flex:none;border-radius:7px}
+header b{font-size:18px;color:var(--acc)}
+.logo{display:block;width:120px;height:120px;margin:8px 0 16px;border-radius:26px;box-shadow:0 1px 3px rgba(0,0,0,.12)}header span{color:var(--mut);font-size:13px}
 header #install{margin:0}
 header #who{margin-left:auto;color:var(--ink)}header #who .s{margin:0 0 0 6px}
 td select{min-width:110px;margin-top:0}

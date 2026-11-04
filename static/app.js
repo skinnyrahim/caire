@@ -57,7 +57,7 @@ function shell(on) {
 }
 function showLogin() {
   shell(false);
-  $('#m').innerHTML = `<h2>Sign in</h2><p class="mut">Use the staff account given to you by the CAIRE administrator.</p>
+  $('#m').innerHTML = `<img class="logo" src="/icons/logo.png" alt="CAIRE" width="120" height="120"><h2>Sign in</h2><p class="mut">Use the staff account given to you by the CAIRE administrator.</p>
   <form class="card" onsubmit="event.preventDefault();doLogin(this.querySelector('button'))"><div class="g"><label>Username<input id="lu" autocomplete="username" autocapitalize="none"></label>
   <label>Password<input id="lp" type="password" autocomplete="current-password"></label></div><button class="b">Sign in</button></form>`;
   $('#lu').focus();
