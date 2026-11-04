@@ -9,10 +9,10 @@ Staff sign in with a role: desk (enrol, premiums, claims), reviewer (also
 approves, pays and spot-checks claims, but never their own) or admin (also
 manages staff). Every change is written to the audit log.
 
-Mobile money and SMS are simulated: the payment prompt is approved or declined
-from the desk screen, and the claim code is returned to the desk so it can be
-shown on a mock phone. Swap `send_sms` and the payment endpoints for real
-provider integrations before going live.
+Mobile money goes through Paystack (PAYSTACK_SECRET_KEY) and SMS through
+Arkesel (ARKESEL_API_KEY); see providers.py. Without a key, and only while
+CAIRE_SIMULATE=1, that channel is simulated: the payment prompt is answered on
+the desk screen and the claim code is shown on a mock phone.
 """
 import csv
 import io
@@ -29,6 +29,9 @@ from functools import wraps
 
 from flask import Flask, Response, g, jsonify, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
+
+import providers
+from providers import PAYSTACK_PROVIDERS, ProviderError
 
 # Benefit levels are illustrative (GHS). Override with env vars for a pilot.
 CFG = {
@@ -77,7 +80,9 @@ CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, n INTEGER NOT NULL);
 # Columns added after the first release; created on start-up if missing.
 MIGRATIONS = [("members", "enrolled_by", "TEXT"), ("payments", "requested_by", "TEXT"),
               ("pending_claims", "created_by", "TEXT"), ("claims", "created_by", "TEXT"),
-              ("claims", "reviewed_by", "TEXT")]
+              ("claims", "reviewed_by", "TEXT"), ("payments", "provider", "TEXT"),
+              ("payments", "reference", "TEXT"), ("payments", "provider_status", "TEXT"),
+              ("payments", "message", "TEXT")]
 
 class Row(dict):
     """Result row readable by column name or position, like sqlite3.Row."""
@@ -135,6 +140,7 @@ def init_schema(c, pg):
             c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}")
         elif col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]:
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS payments_reference ON payments(reference)")
     for table in ("members", "claims"):
         c.execute(f"INSERT INTO counters(name,n) SELECT ?, COALESCE(MAX(seq),0) FROM {table} WHERE true "
                   "ON CONFLICT(name) DO NOTHING", (table,))
@@ -156,6 +162,11 @@ def create_app(db_path=None, today=None):
     app = Flask(__name__, static_folder="static", static_url_path="")
     app.config["DB"] = db_path or os.environ.get("DATABASE_URL") or os.environ.get("CAIRE_DB", "caire.db")
     app.config["SIMULATE"] = os.environ.get("CAIRE_SIMULATE", "1") == "1"
+    app.config["PAYSTACK_KEY"] = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
+    # Paystack needs an email per customer; members rarely have one. example.com never receives mail.
+    app.config["PAYSTACK_EMAIL_DOMAIN"] = os.environ.get("PAYSTACK_EMAIL_DOMAIN", "example.com").strip()
+    app.config["ARKESEL_KEY"] = os.environ.get("ARKESEL_API_KEY", "").strip()
+    app.config["ARKESEL_SENDER"] = os.environ.get("ARKESEL_SENDER", "CAIRE").strip()
     # `today` can be a callable returning a date, for tests.
     app.config["TODAY"] = today or date.today
     app.config.update(
@@ -207,7 +218,7 @@ def create_app(db_path=None, today=None):
         return request.get_json(silent=True) or {}
 
     # ---------- staff auth ----------
-    PUBLIC = {"static", "index", "healthz", "login", "me", "logout"}
+    PUBLIC = {"static", "index", "healthz", "login", "me", "logout", "paystack_webhook"}
     PW_CHANGE_OK = {"me", "logout", "change_password", "config"}
 
     def current_user():
@@ -313,9 +324,22 @@ def create_app(db_path=None, today=None):
             p = "0" + p[3:]
         return p
 
-    def send_sms(phone, text):
-        # Integration point for a real SMS gateway. Simulated by default.
-        app.logger.info("SMS to %s: %s", phone, text)
+    def send_sms(phone, text, required=True):
+        """Sends by Arkesel. `required` SMS (claim codes) raise if they can't be sent."""
+        if app.config["ARKESEL_KEY"]:
+            try:
+                providers.arkesel_send(app.config["ARKESEL_KEY"], app.config["ARKESEL_SENDER"], phone, text)
+                return
+            except ProviderError as e:
+                if required:
+                    raise Bad(f"Could not send the SMS: {e}", 502)
+                app.logger.warning("SMS to %s failed: %s", phone, e)
+                return
+        if not app.config["SIMULATE"]:
+            if required:
+                raise Bad("SMS is not set up yet. Ask the administrator to add the Arkesel API key.", 503)
+            return
+        app.logger.info("Simulated SMS to %s: %s", phone, text)
 
     def do_enrol(name, phone, card="", nhis=""):
         seq = next_seq("members")
@@ -327,22 +351,32 @@ def create_app(db_path=None, today=None):
         audit("member_enrolled", mid)
         return mid
 
-    def do_approve(pid):
+    def do_approve(pid, confirmed=False, notify=True):
+        """Starts cover for a payment. `confirmed`: the provider says the money arrived, which
+        counts even if the desk had cancelled the prompt."""
         p = db().execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
         if not p:
             raise Bad("Payment not found.", 404)
-        if p["status"] != "pending":
+        if p["status"] == "approved" and confirmed:
+            return date.fromisoformat(p["cover_to"])  # repeat notification
+        if p["status"] not in ({"pending", "expired", "declined"} if confirmed else {"pending"}):
             raise Bad("This payment prompt has already been answered.", 409)
         pt = paid_through(p["member_id"])
         start = td()
         if pt and date.fromisoformat(pt) >= start:
             start = date.fromisoformat(pt) + timedelta(days=1)  # renewals stack
         end = start + timedelta(days=CFG["cover_days"] - 1)
-        db().execute(
-            "UPDATE payments SET status='approved', settled_at=?, cover_from=?, cover_to=? WHERE id=?",
-            (now(), start.isoformat(), end.isoformat(), pid),
-        )
+        n = db().execute(
+            "UPDATE payments SET status='approved', settled_at=?, cover_from=?, cover_to=? WHERE id=? AND status=?",
+            (now(), start.isoformat(), end.isoformat(), pid, p["status"]),
+        ).rowcount
+        if not n:  # settled by a simultaneous request (Postgres waits for it, then skips)
+            return date.fromisoformat(get_payment(pid)["cover_to"])
         audit("payment_approved", p["member_id"], f"payment {pid}, cover to {end.isoformat()}")
+        if notify:
+            m = member(p["member_id"])
+            send_sms(m["phone"], f"CAIRE Cover: we received GHS {p['member_amount']} for {m['name']}. "
+                                 f"You are covered until {end.strftime('%d %b %Y')}.", required=False)
         return end
 
     # ---------- errors ----------
@@ -467,7 +501,8 @@ def create_app(db_path=None, today=None):
 
     @app.get("/api/config")
     def config():
-        return jsonify({**CFG, "simulate": app.config["SIMULATE"], "today": td().isoformat()})
+        return jsonify({**CFG, "simulate": app.config["SIMULATE"], "today": td().isoformat(),
+                        "payments_live": bool(app.config["PAYSTACK_KEY"]), "sms_live": bool(app.config["ARKESEL_KEY"])})
 
     @app.get("/api/members")
     def members():
@@ -499,6 +534,48 @@ def create_app(db_path=None, today=None):
         ).fetchall()
         return jsonify([dict(r) for r in rows])
 
+    def payment_json(pid):
+        p = db().execute("SELECT p.*, m.name member_name, m.phone FROM payments p JOIN members m ON m.id=p.member_id"
+                         " WHERE p.id=?", (pid,)).fetchone()
+        return {"id": p["id"], "member_id": p["member_id"], "member_name": p["member_name"], "phone": p["phone"],
+                "network": p["network"], "amount": p["member_amount"], "status": p["status"],
+                "mode": "paystack" if p["provider"] == "paystack" else "simulated",
+                "provider_status": p["provider_status"], "message": p["message"], "paid_through": p["cover_to"]}
+
+    def get_payment(pid):
+        p = db().execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if not p:
+            raise Bad("Payment not found.", 404)
+        return p
+
+    def paystack(method, path, payload=None):
+        return providers.paystack_request(app.config["PAYSTACK_KEY"], method, path, payload)
+
+    def settle_success(p, data):
+        """Paystack says the charge succeeded: check the amount, then start cover."""
+        if data.get("amount") != p["member_amount"] * 100 or (data.get("currency") or "GHS") != "GHS":
+            if p["provider_status"] != "amount_mismatch":
+                db().execute("UPDATE payments SET status='review', provider_status='amount_mismatch', message=? WHERE id=?",
+                             (f"Paystack reported {data.get('currency')} {data.get('amount')} (pesewas), not "
+                              f"GHS {p['member_amount']}. Check in Paystack before giving cover.", p["id"]))
+                audit("payment_amount_mismatch", p["member_id"], f"payment {p['id']}")
+            return
+        do_approve(p["id"], confirmed=True)
+        db().execute("UPDATE payments SET provider_status='success', message=NULL WHERE id=?", (p["id"],))
+
+    def apply_charge(p, data):
+        """Records the state Paystack returned for a charge."""
+        st = data.get("status")
+        msg = data.get("display_text") or data.get("gateway_response") or data.get("message")
+        if st == "success":
+            settle_success(p, data)
+        elif st in ("failed", "abandoned", "reversed"):
+            db().execute("UPDATE payments SET status='declined', provider_status=?, message=?, settled_at=? "
+                         "WHERE id=? AND status='pending'", (st, msg or "The payment did not go through.", now(), p["id"]))
+            audit("payment_failed", p["member_id"], f"payment {p['id']}: {msg}")
+        elif st:
+            db().execute("UPDATE payments SET provider_status=?, message=? WHERE id=?", (st, msg, p["id"]))
+
     @app.post("/api/payments")
     def request_payment():
         b = body()
@@ -506,20 +583,96 @@ def create_app(db_path=None, today=None):
         net = b.get("network")
         if net not in CFG["networks"]:
             raise Bad("Pick a mobile money network.")
+        live = bool(app.config["PAYSTACK_KEY"])
+        if not live and not app.config["SIMULATE"]:
+            raise Bad("Mobile money is not set up yet. Ask the administrator to add the Paystack key.", 503)
         db().execute("UPDATE payments SET status='expired' WHERE member_id=? AND status='pending'", (m["id"],))
         pid = db().execute(
-            "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at,requested_by) VALUES(?,?,?,?, 'pending', ?, ?) RETURNING id",
-            (m["id"], net, CFG["member_share"], CFG["subsidy"], now(), me_name()),
+            "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at,requested_by,provider)"
+            " VALUES(?,?,?,?, 'pending', ?, ?, ?) RETURNING id",
+            (m["id"], net, CFG["member_share"], CFG["subsidy"], now(), me_name(), "paystack" if live else "simulated"),
         ).fetchone()[0]
+        audit("payment_requested", m["id"], f"payment {pid}, {net}")
+        if live:
+            ref = f"CCP-{pid}-{secrets.token_hex(4)}"
+            db().execute("UPDATE payments SET reference=? WHERE id=?", (ref, pid))
+            db().commit()  # saved before Paystack is called, so its notification can always find it
+            try:
+                data = paystack("POST", "/charge", {
+                    "email": f"{m['id'].lower()}@{app.config['PAYSTACK_EMAIL_DOMAIN']}",
+                    "amount": CFG["member_share"] * 100, "currency": "GHS", "reference": ref,
+                    "mobile_money": {"phone": m["phone"], "provider": PAYSTACK_PROVIDERS[net]},
+                    "metadata": {"member_id": m["id"], "payment_id": pid},
+                })
+            except ProviderError as e:
+                db().execute("UPDATE payments SET status='declined', provider_status='error', message=?, settled_at=? WHERE id=?",
+                             (str(e), now(), pid))
+                db().commit()
+                raise Bad(f"Mobile money: {e}", 502)
+            apply_charge(get_payment(pid), data)
         db().commit()
-        return jsonify({"id": pid, "member_id": m["id"], "member_name": m["name"],
-                        "phone": m["phone"], "network": net, "amount": CFG["member_share"]}), 201
+        return jsonify(payment_json(pid)), 201
 
-    # Simulated mobile money callback. A real integration would call this
-    # from the provider's webhook after verifying its signature.
+    @app.get("/api/payments/<int:pid>")
+    def payment_status(pid):
+        """Asks Paystack for the latest state (in case its notification hasn't arrived)."""
+        p = get_payment(pid)
+        if p["provider"] == "paystack" and p["status"] in ("pending", "expired") and p["reference"]:
+            try:
+                apply_charge(p, paystack("GET", f"/transaction/verify/{p['reference']}"))
+                db().commit()
+            except ProviderError:
+                pass  # not settled yet, or Paystack unreachable: keep waiting
+        return jsonify(payment_json(pid))
+
+    @app.post("/api/payments/<int:pid>/otp")
+    def payment_otp(pid):
+        """Some networks (Telecel) send the member a code that must be entered here."""
+        p = get_payment(pid)
+        otp = re.sub(r"\s", "", body().get("otp") or "")
+        if p["provider"] != "paystack" or p["status"] != "pending":
+            raise Bad("This payment is not waiting for a code.", 409)
+        if not otp:
+            raise Bad("Enter the code the member received.")
+        try:
+            data = paystack("POST", "/charge/submit_otp", {"otp": otp, "reference": p["reference"]})
+        except ProviderError as e:
+            raise Bad(f"Mobile money: {e}", 502)
+        apply_charge(p, data)
+        db().commit()
+        return jsonify(payment_json(pid))
+
+    @app.post("/api/payments/<int:pid>/cancel")
+    def payment_cancel(pid):
+        p = get_payment(pid)
+        if p["status"] == "pending":
+            db().execute("UPDATE payments SET status='expired', settled_at=? WHERE id=?", (now(), pid))
+            audit("payment_cancelled", p["member_id"], f"payment {pid}")
+            db().commit()
+        return jsonify(payment_json(pid))
+
+    @app.post("/api/paystack/webhook")
+    def paystack_webhook():
+        key = app.config["PAYSTACK_KEY"]
+        raw = request.get_data()
+        if not key or not providers.paystack_signature_ok(key, raw, request.headers.get("X-Paystack-Signature")):
+            return jsonify(error="Bad signature."), 401
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            return jsonify(error="Bad JSON."), 400
+        data = ev.get("data") or {}
+        if ev.get("event") == "charge.success" and data.get("reference"):
+            p = db().execute("SELECT * FROM payments WHERE reference=?", (data["reference"],)).fetchone()
+            if p:
+                settle_success(p, data)
+                db().commit()
+        return jsonify({"ok": True})
+
+    # Simulated mobile money: the desk answers the prompt shown on screen.
     @app.post("/api/payments/<int:pid>/<action>")
     def settle_payment(pid, action):
-        if not app.config["SIMULATE"]:
+        if not app.config["SIMULATE"] or get_payment(pid)["provider"] == "paystack":
             raise Bad("Payments are confirmed by the mobile money provider.", 403)
         if action == "approve":
             end = do_approve(pid)
@@ -591,11 +744,11 @@ def create_app(db_path=None, today=None):
         exp = (datetime.now() + timedelta(minutes=CFG["otp_minutes"])).isoformat(timespec="seconds")
         pending_id = db().execute("INSERT INTO pending_claims(data,otp,expires_at,created_by) VALUES(?,?,?,?) RETURNING id",
                                   (json.dumps(data), otp, exp, me_name())).fetchone()[0]
-        db().commit()
         send_sms(m["phone"], f"CAIRE Cover: your code to confirm today's visit is {otp}. "
                              "Share it only if you are at the clinic.")
+        db().commit()  # only once the SMS has gone
         out = {"pending_id": pending_id, "member_name": m["name"], "phone": m["phone"], **data}
-        if app.config["SIMULATE"]:
+        if app.config["SIMULATE"] and not app.config["ARKESEL_KEY"]:
             out["simulated_code"] = otp
         return jsonify(out), 201
 
@@ -763,7 +916,7 @@ def create_app(db_path=None, today=None):
                 pid = db().execute(
                     "INSERT INTO payments(member_id,network,member_amount,subsidy_amount,status,requested_at) VALUES(?,?,?,?,'pending',?) RETURNING id",
                     (mid, "MTN MoMo", CFG["member_share"], CFG["subsidy"], now())).fetchone()[0]
-                do_approve(pid)
+                do_approve(pid, notify=False)
         db().commit()
         return jsonify({"added": added})
 

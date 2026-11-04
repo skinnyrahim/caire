@@ -97,11 +97,38 @@ CAIRE Cover is an installable web app (PWA). Once it is live on its `https://` a
 It then opens full-screen from its own icon. Updates arrive automatically on the next launch. Screens open on a
 weak connection, but enrolling, payments and claims need the internet; member data is never stored on the device.
 
+## Real mobile money and SMS
+
+Mobile money goes through **Paystack** and SMS through **Arkesel** (`providers.py`). Each switches on when its key is
+set in Render (**caire-cover > Environment**), and the service redeploys.
+
+| Variable | Value |
+|---|---|
+| `PAYSTACK_SECRET_KEY` | Paystack **Settings > API Keys & Webhooks**. `sk_test_...` for trying it out, `sk_live_...` for real money |
+| `ARKESEL_API_KEY` | Arkesel dashboard, SMS API key |
+| `ARKESEL_SENDER` | Your approved sender ID (max 11 characters). Defaults to `CAIRE` |
+| `PAYSTACK_EMAIL_DOMAIN` | Optional. Paystack needs an email per customer; members get `<member-id>@<domain>`, default `example.com` (never receives mail) |
+
+In Paystack, set the **Webhook URL** to `https://<your-app>.onrender.com/api/paystack/webhook`
+(Settings > API Keys & Webhooks, for test and live mode separately).
+
+How it works:
+
+- **Premium:** the desk sends the prompt; Paystack asks the member to approve on their phone (MTN, AirtelTigo) or, for
+  Telecel, texts them a code the desk enters first. Cover starts only when Paystack confirms the money arrived (its
+  signed webhook, or the app asking Paystack directly every few seconds), and only if the amount is right. A wrong amount
+  is marked **Check in Paystack** and gives no cover. If the desk cancels but the member pays anyway, cover still starts.
+  The member gets an SMS saying how long they are covered.
+- **Claims:** the 4-digit code goes to the member by SMS and is never shown on the desk screen. If the SMS can't be sent
+  (e.g. no Arkesel credit), the claim isn't started and the desk sees why.
+
+Paystack charges a fee per mobile money payment, taken from the amount received.
+
 ## Simulation mode
 
-`CAIRE_SIMULATE=1` (the default) is for demos and training: the mobile money prompt is approved or declined on the desk
-screen, the claim code is shown on a mock phone, and "Load sample data" / "Reset" are available. Before a live pilot:
+With `CAIRE_SIMULATE=1` (the default), a channel without its key is simulated for demos and training: the mobile money
+prompt is answered on the desk screen, and the claim code is shown on a mock phone. "Load sample data" / "Reset" are
+also available to admins. The header says which channels are simulated.
 
-- set `CAIRE_SIMULATE=0`, which hides the code from the desk and disables seed/reset
-- connect `send_sms` in `app.py` to an SMS gateway
-- replace `POST /api/payments/<id>/approve|decline` with the mobile money provider's verified webhook
+Once both keys are set and checked, set `CAIRE_SIMULATE=0`: nothing is ever simulated, demo tools are disabled, and a
+missing key shows an error instead of falling back to simulation.

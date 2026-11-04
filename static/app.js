@@ -79,11 +79,12 @@ function doPw(btn) {
     toast('Password saved.'); ME.must_change = false; await start();
   }, btn);
 }
-function logout() { run(async () => { await api('logout', {}); ME = null; pend = pc = elig = null; tab = 0; showLogin(); }); }
+function logout() { run(async () => { await api('logout', {}); clearTimeout(payTimer); ME = null; pend = pc = elig = null; tab = 0; showLogin(); }); }
 async function start() {
   if (ME.must_change) return showPwChange(true);
   CFG = await api('config');
-  $('#sub').textContent = 'Clinic desk, pilot' + (CFG.simulate ? '. Mobile money and SMS are simulated.' : '');
+  const sim = [!CFG.payments_live && 'Mobile money', !CFG.sms_live && 'SMS'].filter(Boolean);
+  $('#sub').textContent = 'Clinic desk, pilot' + (sim.length ? `. ${sim.join(' and ')} ${sim.length > 1 ? 'are' : 'is'} simulated.` : '');
   $('#foot').textContent = `Benefits per member per year: gap cover up to ${gh(CFG.gap_limit)}, hospital cash ${gh(CFG.cash_per_day)} a day for up to ${CFG.cash_max_days} days.`;
   $('#who').innerHTML = `${esc(ME.name)} <span class="mut">(${esc(ME.role)})</span> <button class="s" onclick="showPwChange(false)">Password</button><button class="s" onclick="logout()">Sign out</button>`;
   shell(true);
@@ -117,11 +118,51 @@ function askPay(btn) {
   run(async () => {
     if (!val('pm')) throw new Error('Enrol a member first.');
     pend = await api('payments', {member_id: val('pm'), network: val('pn')});
-    render();
+    payTries = 0; payUpdate();
+  }, btn);
+}
+
+// Real mobile money: ask the server (which asks Paystack) every 5 s until the payment settles.
+let payTimer = null, payTries = 0;
+function payUpdate() {
+  clearTimeout(payTimer);
+  if (!pend) return;
+  if (pend.status === 'approved') {
+    toast(`Payment received. ${pend.member_name} is covered until ${pend.paid_through}.`);
+    pend = null; load(); return;
+  }
+  if (pend.status === 'declined' || pend.status === 'review') {
+    toast(pend.message || 'Payment did not go through. No cover started.');
+    pend = null; load(); return;
+  }
+  if (pend.status === 'expired') { pend = null; load(); return; }
+  render();
+  if (pend.mode === 'paystack' && pend.provider_status !== 'send_otp' && payTries < 36) {
+    payTimer = setTimeout(payPoll, 5000);
+  }
+}
+async function payPoll(btn) {
+  if (!pend) return;
+  payTries++;
+  const was = pend.status + pend.provider_status;
+  try { pend = await api('payments/' + pend.id); } catch (e) { if (btn) toast(e.message); }
+  if (btn || pend.status + pend.provider_status !== was || pend.status !== 'pending') payUpdate();
+  else payTimer = setTimeout(payPoll, 5000);
+}
+function payCheck(btn) { payTries = 0; run(() => payPoll(btn), btn); }
+function payOtp(btn) {
+  run(async () => { pend = await api(`payments/${pend.id}/otp`, {otp: val('potp')}); payTries = 0; payUpdate(); }, btn);
+}
+function payCancel(btn) {
+  run(async () => {
+    await api(`payments/${pend.id}/cancel`, {});
+    clearTimeout(payTimer); toast('Prompt cancelled. If the member still pays, cover starts automatically.');
+    pend = null; await load();
   }, btn);
 }
 function payAnswer(ok, btn) {
   run(async () => {
+    payTries = 0;
     const r = await api(`payments/${pend.id}/${ok ? 'approve' : 'decline'}`, {});
     toast(ok ? `Payment received. ${pend.member_name} is covered until ${r.paid_through}.` : 'Payment declined. No cover started.');
     pend = null; await load();
@@ -179,13 +220,28 @@ function vEnrol() {
 }
 
 function vPay() {
-  const box = pend ? `<div class="phone"><small>${CFG.simulate ? 'Simulated ' : ''}${esc(pend.network)} prompt on ${esc(pend.phone)}</small>Pay ${gh(pend.amount)} to CAIRE Cover for ${esc(pend.member_name)}?<br><br>
-    <button class="b" onclick="payAnswer(true,this)">Approve</button> <button class="s r" onclick="payAnswer(false,this)">Decline</button></div>` : '';
-  const st = {approved: 'ok', declined: 'bad', expired: 'bad', pending: 'warn'};
+  let box = '';
+  if (pend && pend.mode === 'simulated') {
+    box = `<div class="phone"><small>Simulated ${esc(pend.network)} prompt on ${esc(pend.phone)}</small>Pay ${gh(pend.amount)} to CAIRE Cover for ${esc(pend.member_name)}?<br><br>
+    <button class="b" onclick="payAnswer(true,this)">Approve</button> <button class="s r" onclick="payAnswer(false,this)">Decline</button></div>`;
+  } else if (pend) {
+    const otp = pend.provider_status === 'send_otp';
+    box = `<div class="phone"><small>${esc(pend.network)} · ${esc(pend.phone)}</small>
+    ${otp ? `${esc(pend.member_name)} has received a code by SMS from ${esc(pend.network)}. Enter it to send the payment request.
+      <label style="margin-top:10px">Code<input id="potp" inputmode="numeric" autocomplete="one-time-code"></label><br><button class="b" onclick="payOtp(this)">Continue</button>`
+    : `<b>Waiting for ${esc(pend.member_name)} to approve ${gh(pend.amount)}</b> on their phone, usually by entering their mobile money PIN.
+      ${pend.message ? `<p class="mut" style="margin:8px 0 0">${esc(pend.message)}</p>` : ''}
+      <p class="mut" style="margin:8px 0">${payTries < 36 ? 'This updates by itself.' : 'Still waiting. Check again, or cancel and try once more.'}</p>
+      <button class="s" onclick="payCheck(this)">Check now</button>`}
+    <button class="s r" onclick="payCancel(this)">Cancel</button></div>`;
+  }
+  const st = {approved: 'ok', declined: 'bad', expired: 'bad', pending: 'warn', review: 'bad'};
+  const label = p => p.status === 'approved' ? `Cover ${p.cover_from} to ${p.cover_to}` : p.status === 'review' ? 'Check in Paystack'
+    : p.status === 'expired' ? 'cancelled' : p.status;
   return `<h2>Collect premium</h2><p class="mut">Each ${CFG.cover_days}-day cover costs ${gh(CFG.premium)}: the member pays ${gh(CFG.member_share)} and RUG subsidises ${gh(CFG.subsidy)}. Paying early adds ${CFG.cover_days} days after the current cover ends.</p>
-  <div class="card"><div class="g"><label>Member<select id="pm">${opts(members)}</select></label><label>Network<select id="pn">${CFG.networks.map(n => `<option>${esc(n)}</option>`).join('')}</select></label></div>
+  <div class="card"><div class="g"><label>Member<select id="pm">${members.map(m => `<option value="${esc(m.id)}"${pend && pend.member_id === m.id ? ' selected' : ''}>${esc(m.name)} (${esc(m.id)})</option>`).join('')}</select></label><label>Network<select id="pn">${CFG.networks.map(n => `<option${pend && pend.network === n ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label></div>
   <button class="b" onclick="askPay(this)">Send payment prompt</button>${box}</div>
-  <div class="card tw"><table><tr><th>Date</th><th>Member</th><th>Network</th><th>Member paid</th><th>RUG subsidy</th><th>Status</th></tr>${pays.map(p => `<tr><td>${esc(p.requested_at.slice(0, 10))}</td><td>${esc(p.member_name)}</td><td>${esc(p.network)}</td><td>${gh(p.member_amount)}</td><td>${gh(p.subsidy_amount)}</td><td>${pill(p.status === 'approved' ? `Cover ${p.cover_from} to ${p.cover_to}` : p.status, st[p.status])}</td></tr>`).join('') || '<tr><td colspan="6" class="mut">No payments yet.</td></tr>'}</table></div>`;
+  <div class="card tw"><table><tr><th>Date</th><th>Member</th><th>Network</th><th>Member paid</th><th>RUG subsidy</th><th>Status</th></tr>${pays.map(p => `<tr><td>${esc(p.requested_at.slice(0, 10))}</td><td>${esc(p.member_name)}</td><td>${esc(p.network)}</td><td>${gh(p.member_amount)}</td><td>${gh(p.subsidy_amount)}</td><td>${pill(label(p), st[p.status])}${p.message && p.status !== 'approved' ? `<br><span class="mut">${esc(p.message)}</span>` : ''}</td></tr>`).join('') || '<tr><td colspan="6" class="mut">No payments yet.</td></tr>'}</table></div>`;
 }
 
 function vCheck() {
